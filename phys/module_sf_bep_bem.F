@@ -412,6 +412,7 @@ use module_wrf_error
       real sf_ac
       integer ibui,nbui
       integer nlev(nz_um)
+
  
 !
 !End new variables
@@ -1449,6 +1450,9 @@ do iz= kts,kte
 
       real sflev(nz_um,nz_um)     ! sensible heat flux due to the air conditioning systems [W]
       real lflev(nz_um,nz_um)     ! latent heat flux due to the air conditioning systems  [W]
+      ! Cooling Tower JCP
+      real sfbui(nz_um)           ! sensible heat flux due to the air conditioning systems for entire building [W]
+      real lfbui(nz_um)           ! latent heat flux due tot he air conditioning systems for entire building [W]
       real consumlev(nz_um,nz_um) ! consumption due to the air conditioning systems [W]
       real sflev1D(nz_um)         ! sensible heat flux due to the air conditioning systems [W]
       real lflev1D(nz_um)         ! latent heat flux due to the air conditioning systems  [W]
@@ -1743,15 +1747,30 @@ do iz= kts,kte
          hfgrb(2,ibui)=hfgrb(1,ibui)
 !End temporal modifications  
 !        
+           ! Initialize CT arrays - JCP
+           sfbui(ibui)=0
+           lfbui(ibui)=0
+
            do iz=1,nz_um
              qlev(iz,ibui)=qlevb1D(iz)
              tlev(iz,ibui)=tlevb1D(iz)
-             sflev(iz,ibui)=sflev1D(iz)
-             lflev(iz,ibui)=lflev1D(iz)
+             if(iurb.eq.3) then
+                 sfbui(ibui)=sfbui(ibui)+sflev1D(iz)
+                 lfbui(ibui)=lfbui(ibui)+lflev1D(iz)
+                 sflev(iz,ibui)=0
+                 lflev(iz,ibui)=0
+             else
+                 sflev(iz,ibui)=sflev1D(iz)
+                 lflev(iz,ibui)=lflev1D(iz)
+             endif
              consumlev(iz,ibui)=consumlev1D(iz)
              sfvlev(iz,ibui)=sfvlev1D(iz)
              lfvlev(iz,ibui)=lfvlev1D(iz)
            enddo
+
+           if((iurb.eq.1 .OR. iurb.eq.4 .OR. iurb.eq.10) .and. sfbui(ibui).gt.0) then
+               call cooling_tower(ibui,nlev,tmp_u,pr_u,qv_u,sfbui,lfbui,sflev,lflev)
+           endif
  
            do id=1,ndm
               do ily=1,nwr_u
@@ -5632,6 +5651,155 @@ do iz= kts,kte
 20     continue    
        return
        end subroutine icBEPHI_XY
+
+subroutine cooling_tower(ibui,nlev,tmp_u,pr_u,qv_u,sfbui,lfbui,                 &
+                          sflev,lflev)
+
+!----------------------------------------------------------------------
+! This routine calculates the latent and sensible heat flux contribution from a
+! cooling tower based on the heat exchanger effectiveness idea. The
+! effectiveness of a heat exchanger is the ratio of the actual heat transfer
+! rate to the maximum rate permitted by the second law of thermodynamics. In the
+! context of a cooling tower, the maximum heat transfer is limited by the
+! enthalpy difference between inlet air and outlet air if it were saturated at
+! the temperature of the warm inlet water.
+! ----------------------------------------------------------------------
+
+  implicit none
+
+! ----------------------------------------------------------------------
+! INPUT:
+! ----------------------------------------------------------------------
+      integer ibui
+      integer nlev(nz_um)       ! Number of levels in each different type of buildings in an urban class
+      real tmp_u(nz_um)         ! Air Temperature [K]
+      real pr_u(nz_um)          ! Air pressure [Pa]
+      real qv_u(nz_um)          ! Specific humidity [Kg/Kg]
+      real sfbui(nz_um)         ! sensible heat flux due to the air conditioning
+                                ! systems for the whole building [W]
+      real lfbui(nz_um)         ! latent heat flux due to the air conditioning
+                                ! systems for the whole building [W]
+
+      ! ----------------------------------------------------------------------
+! OUTPUT:
+! ----------------------------------------------------------------------
+      real sflev(nz_um,nz_um)      ! sensible heat flux due to the air
+                                   ! conditioning systems [W]
+      real lflev(nz_um,nz_um)      ! latent heat flux due to the air
+                                   ! conditioning systems [W]
+! ----------------------------------------------------------------------
+! LOCAL:
+! ----------------------------------------------------------------------
+      real tb,tu,a,b,taon,taon1,ten,c,diff,z,eso,qvos,rh
+      real prr    ! Rooftop Pressure
+      real es    ! Saturated vapor pressue
+      real qvs   ! Saturated specific humidity
+      real qvi   ! Cooling tower inlet air specific humidity
+      real qvo   ! Cooling tower oulet air specific humidity
+      real twi   ! cooling tower inlet water temperature
+      real two   ! cooling tower inlet water temperature
+      real tai   ! cooling tower inlet air temperature
+      real tao   ! cooling tower onlet air temperature
+      real ma    ! mass flow rate of air
+      real hso   ! enthalpy of the outlet air as if it were saturated at twi
+      real hai   ! enthalpy of the inlet air
+      real hao   ! enthalpy of the outlet air
+      real eff   ! Efficiency
+      real cmin  !
+      parameter (eff=0.6)
+      real latent             ! Latent heat of vaporization [J/kg] (used in BEM)
+      parameter (latent=2.45e+06)
+      real cp               ! Specific heat at constant pressure [J/kgK]
+      parameter (cp=1004)
+      real cpw              ! Specific heat of water at constant pressure [J/kgC]
+      parameter (cpw=1840)
+      real trefi              ! Refrigerant temperature at superfeated conditions
+      parameter (trefi=60)
+      double precision time1,time2
+! ----------------------------------------------------------------------
+! END VARIABLES DEFINITIONS
+! ----------------------------------------------------------------------
+
+tai=tmp_u(nlev(ibui))-273.15
+qvi=qv_u(nlev(ibui))
+prr=0.01*pr_u(nlev(ibui))
+
+
+!Wet Bulb Temperature (Stull 2011)
+
+      eso=6.11*(10**(tai*7.5/(237.7+tai)))
+      qvos=0.622*eso/(prr-0.378*eso)
+      rh=100*qvi/qvos
+      two=tai*atan(0.151977*((rh+8.313659)**0.5))+atan(tai+rh)-atan(rh-1.676331)+0.00391838*(rh**(1.5))*atan(0.023101*rh)-4.686035
+
+!Heat Exchanger
+
+cmin=sfbui(ibui)/((trefi-two)*eff)
+
+twi=two+(sfbui(ibui)/cmin)
+
+
+! Air flow Calculation
+
+      hai= cp*tai + qvi*(cpw*tai + latent)
+
+      es=6.11*(10**(twi*7.5/(237.7+twi)))
+      qvs=0.62197*es/(prr-0.378*es)
+      hso= cp*twi + qvs*(cpw*twi + latent)
+
+      ma=sfbui(ibui)/(eff*(hso-hai))
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+!Outlet air calculation
+
+!Temperature First Guess
+tb=tai  !Bottom temperature
+tu=twi  !Upper temperature
+
+     c=hai+(eff*(hso-hai))
+     taon=(tb+tu)/2
+
+
+  loop: do
+
+!a=taon*6.11*10**(7.5*taon/(237.7+taon))*(0.62197*cpw-cp*0.378) + 6.11*10**(7.5*taon/(237.7+taon))*(0.6197*latent+c*0.378) + taon*prr*cp - c*prr
+
+z=6.11*10**(7.5*taon/(237.7+taon))
+
+a=taon*z*(0.62197*cpw-cp*0.378) + z*(0.6197*latent+c*0.378) + taon*prr*cp - c*prr
+
+
+!b=(0.62197*cpw-cp*0.378)*6.11*(10**(7.5*taon/(237.7+taon))+taon*(10**(7.5*taon/(237.7+taon))*2.3026*((7.5/(237.7+taon))&
+!      &-(7.5*taon/((237.7+taon)**2)))))+(6.11*(0.6197*latent+c*0.378))*(10**(7.5*taon/(237.7+taon))*2.3026*((7.5/(237.7+taon))-(7.5*taon/((237.7+taon)**2))))+(prr*cp)
+
+b=(0.62197*cpw-cp)*z+taon*((z/6.11*2.3026*((7.5/(237.7+taon))-(7.5*taon/((237.7+taon)**2)))))&
+      & +(6.11*(0.6197*latent+c))*(z/6.11*2.3026*((7.5/(237.7+taon))-(7.5*taon/((237.7+taon)**2))))+(prr*cp)
+
+taon1=taon-a/b
+
+diff=taon1-taon
+
+if (abs(diff).le.0.001) then
+      tao=taon1
+      exit loop
+      else
+      taon=taon1
+ endif
+
+end do loop
+
+
+
+es=6.11*(10**(tao*7.5/(237.7+tao)))
+qvo=0.62197*es/(prr-es*0.378)
+
+lflev(nlev(ibui),ibui)=ma*latent*(qvo-qvi)+lfbui(ibui)
+sflev(nlev(ibui),ibui)=ma*cp*(tao-tai)
+
+return
+end subroutine cooling_tower
+
 !====================================================================72
 !====================================================================72
 END MODULE module_sf_bep_bem

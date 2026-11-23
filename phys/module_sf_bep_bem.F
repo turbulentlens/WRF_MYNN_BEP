@@ -1754,7 +1754,7 @@ do iz= kts,kte
            do iz=1,nz_um
              qlev(iz,ibui)=qlevb1D(iz)
              tlev(iz,ibui)=tlevb1D(iz)
-             if(iurb.eq.3) then
+             if(iurb.eq.1 .OR. iurb.eq.4 .OR. iurb.eq.10) then
                  sfbui(ibui)=sfbui(ibui)+sflev1D(iz)
                  lfbui(ibui)=lfbui(ibui)+lflev1D(iz)
                  sflev(iz,ibui)=0
